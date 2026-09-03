@@ -23,8 +23,8 @@ use crate::{
 
 use moltis_oauth::{
     OAuthConfig, OAuthFlow, OAuthTokens, RegistrationStore, StoredRegistration, TokenStore,
-    fetch_as_metadata, fetch_resource_metadata, normalize_loopback_redirect,
-    parse_www_authenticate, register_client,
+    fetch_as_metadata, fetch_resource_metadata, fetch_resource_metadata_direct,
+    normalize_loopback_redirect, parse_www_authenticate, register_client,
 };
 
 // ── Auth state ─────────────────────────────────────────────────────────────
@@ -410,7 +410,11 @@ impl McpOAuthProvider {
                 debug!(url = %meta_url, "using resource_metadata URL from WWW-Authenticate");
                 let meta_url = Url::parse(&meta_url)
                     .context("invalid resource_metadata URL in WWW-Authenticate header")?;
-                fetch_resource_metadata(&self.http_client, &meta_url).await
+                // The resource_metadata URL from WWW-Authenticate is already the
+                // complete metadata endpoint — do NOT pass through
+                // fetch_resource_metadata() which would append another
+                // /.well-known/oauth-protected-resource suffix.
+                fetch_resource_metadata_direct(&self.http_client, &meta_url).await
             } else {
                 let result = fetch_resource_metadata(&self.http_client, &server_url).await;
                 if result.is_err() && has_path {
@@ -430,9 +434,10 @@ impl McpOAuthProvider {
 
         // Step 2: Get AS metadata — either from resource metadata's
         // authorization_servers list, or directly from the server's origin.
-        let (as_meta, resource) = match resource_meta_result {
+        let (as_meta, resource, resource_scopes) = match resource_meta_result {
             Ok(resource_meta) => {
                 let resource = resource_meta.resource.clone();
+                let scopes = resource_meta.scopes_supported;
                 let as_url_str = resource_meta
                     .authorization_servers
                     .first()
@@ -442,7 +447,7 @@ impl McpOAuthProvider {
                 let as_meta = fetch_as_metadata(&self.http_client, &as_url)
                     .await
                     .context("failed to fetch authorization server metadata")?;
-                (as_meta, resource)
+                (as_meta, resource, scopes)
             },
             Err(e) => {
                 debug!(
@@ -477,8 +482,13 @@ impl McpOAuthProvider {
                 // When resource metadata is unavailable we fall back to origin
                 // as the resource indicator to avoid path-scoped audience mismatches.
                 let resource = Self::origin_resource(&server_url);
-                (as_meta, resource)
+                (as_meta, resource, Vec::new())
             },
+        };
+        let scopes = if resource_scopes.is_empty() {
+            as_meta.scopes_supported.clone()
+        } else {
+            resource_scopes
         };
 
         debug!(
@@ -511,6 +521,7 @@ impl McpOAuthProvider {
                 reg_endpoint,
                 vec![redirect_uri.to_string()],
                 &format!("moltis ({})", self.server_name),
+                &scopes,
             )
             .await
             .context("failed to register OAuth client")?;
@@ -543,7 +554,7 @@ impl McpOAuthProvider {
             client_secret,
             as_meta.authorization_endpoint,
             as_meta.token_endpoint,
-            as_meta.scopes_supported,
+            scopes,
             resource,
         ))
     }
@@ -1047,6 +1058,115 @@ mod tests {
         register.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn fastmail_oauth_registers_and_requests_resource_scopes() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let redirect_uri = "http://localhost:43123/auth/callback";
+        let mcp_scope = "https://www.fastmail.com/dev/mcp";
+
+        let resource_meta = server
+            .mock("GET", "/mcp/.well-known/oauth-protected-resource")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "resource": format!("{base}/mcp"),
+                    "authorization_servers": [base.clone()],
+                    "scopes_supported": [mcp_scope, "offline_access"],
+                    "bearer_methods_supported": ["header"],
+                    "resource_name": "Fastmail MCP API",
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let as_meta = server
+            .mock("GET", "/.well-known/oauth-authorization-server")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "issuer": base.clone(),
+                    "registration_endpoint": format!("{base}/oauth/register"),
+                    "authorization_endpoint": format!("{base}/oauth/authorize"),
+                    "token_endpoint": format!("{base}/oauth/refresh"),
+                    "scopes_supported": [
+                        "urn:ietf:params:oauth:scope:mail",
+                        "urn:ietf:params:oauth:scope:contacts",
+                        "urn:ietf:params:oauth:scope:calendars",
+                        mcp_scope,
+                        "openid",
+                        "profile",
+                        "email",
+                        "offline_access",
+                    ],
+                    "response_types_supported": ["code"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "token_endpoint_auth_methods_supported": ["none"],
+                    "code_challenge_methods_supported": ["S256"],
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let register = server
+            .mock("POST", "/oauth/register")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "redirect_uris": [redirect_uri],
+                "scope": format!("{mcp_scope} offline_access"),
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "client_id": "fastmail-client",
+                    "scope": format!("{mcp_scope} offline_access"),
+                    // Fastmail canonicalizes port-bearing loopback registrations.
+                    "redirect_uris": ["http://localhost/auth/callback"],
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider = McpOAuthProvider::with_stores(
+            "fastmail",
+            &format!("{base}/mcp"),
+            TokenStore::with_path(dir.path().join("tokens.json")),
+            RegistrationStore::with_path(dir.path().join("registrations.json")),
+        );
+
+        let auth_url = provider
+            .start_web_oauth_flow(redirect_uri, None)
+            .await
+            .unwrap();
+        let parsed = Url::parse(&auth_url).unwrap();
+        let params = parsed
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            params.get("scope").map(|value| value.as_ref()),
+            Some(format!("{mcp_scope} offline_access").as_str()),
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(|value| value.as_ref()),
+            Some(redirect_uri),
+        );
+        assert_eq!(
+            params.get("resource").map(|value| value.as_ref()),
+            Some(format!("{base}/mcp").as_str()),
+        );
+
+        resource_meta.assert_async().await;
+        as_meta.assert_async().await;
+        register.assert_async().await;
+    }
+
     #[test]
     fn store_key_format() {
         let provider = McpOAuthProvider::new("my-server", "https://mcp.example.com");
@@ -1136,6 +1256,89 @@ mod tests {
             .map(|(_, v)| v.into_owned())
             .expect("auth URL must have redirect_uri");
         assert_eq!(encoded_redirect, http_redirect);
+
+        resource_meta.assert_async().await;
+        as_meta.assert_async().await;
+        register.assert_async().await;
+    }
+
+    /// RFC 9728 origin-based discovery: the `WWW-Authenticate` header carries
+    /// a `resource_metadata` URL that is the **full metadata endpoint**, not
+    /// the resource's base URL. `discover_and_register` must fetch that URL
+    /// directly instead of appending `/.well-known/oauth-protected-resource`.
+    #[tokio::test]
+    async fn discovery_uses_www_authenticate_resource_metadata_directly() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        // Origin-based layout: /.well-known/oauth-protected-resource/mcp
+        // (as opposed to path-aware: /mcp/.well-known/oauth-protected-resource).
+        let resource_meta = server
+            .mock("GET", "/.well-known/oauth-protected-resource/mcp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "resource": format!("{base}/mcp"),
+                    "authorization_servers": [base.clone()],
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let as_meta = server
+            .mock("GET", "/.well-known/oauth-authorization-server")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "issuer": base.clone(),
+                    "authorization_endpoint": format!("{base}/authorize"),
+                    "token_endpoint": format!("{base}/token"),
+                    "registration_endpoint": format!("{base}/register"),
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let redirect_uri = "http://127.0.0.1:6666/auth/callback";
+        let register = server
+            .mock("POST", "/register")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "client_id": "notion-client",
+                    "redirect_uris": [redirect_uri],
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let provider = McpOAuthProvider::with_stores(
+            "notion",
+            &format!("{base}/mcp"),
+            TokenStore::with_path(dir.path().join("tokens.json")),
+            RegistrationStore::with_path(dir.path().join("registrations.json")),
+        );
+
+        // Simulate the WWW-Authenticate header that Notion sends.
+        let www_authenticate = format!(
+            r#"Bearer realm="OAuth", resource_metadata="{base}/.well-known/oauth-protected-resource/mcp", error="invalid_token""#
+        );
+
+        let (_client_id, _client_secret, _auth_url, _token_url, _scopes, resource) = provider
+            .discover_and_register(Some(&www_authenticate), redirect_uri)
+            .await
+            .unwrap();
+
+        // The resource must come from the metadata JSON (the MCP server URL),
+        // not from the .well-known URL or the origin.
+        assert_eq!(resource, format!("{base}/mcp"));
 
         resource_meta.assert_async().await;
         as_meta.assert_async().await;

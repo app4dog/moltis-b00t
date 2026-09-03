@@ -3,16 +3,24 @@
 //! Supports Docker, Podman, and Apple Container backends, auto-detecting the
 //! best available option (Apple Container on macOS → Podman → Docker).
 
+mod cleanup;
+
 use std::{
     fmt::Display,
+    fs::{File, OpenOptions},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use {
-    crate::error::Error,
+    crate::{browserless, error::Error, types::BrowserlessApiVersion},
+    cleanup::{profile_lock_to_quarantine, quarantine_profile_lock, stop_container_by_id},
     tracing::{debug, info, warn},
 };
+
+#[cfg(test)]
+use cleanup::cleanup_was_confirmed;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -56,6 +64,60 @@ impl<T> ContextExt<T> for Option<T> {
     {
         self.ok_or_else(|| Error::LaunchFailed(f().into()))
     }
+}
+
+fn command_display(program: &str, args: &[String]) -> String {
+    std::iter::once(program.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn output_tail(bytes: &[u8], max_chars: usize) -> String {
+    let text = String::from_utf8_lossy(bytes).trim().to_string();
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let tail = text
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
+}
+
+fn status_display(output: &Output) -> String {
+    output.status.code().map_or_else(
+        || output.status.to_string(),
+        |code| format!("exit code {code}"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn apple_container_command_snapshot(args: &[&str]) -> String {
+    match Command::new("container").args(args).output() {
+        Ok(output) => format!(
+            "status={}, stdout={}, stderr={}",
+            status_display(&output),
+            output_tail(&output.stdout, 1200),
+            output_tail(&output.stderr, 1200)
+        ),
+        Err(error) => format!("failed to run `container {}`: {error}", args.join(" ")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn log_apple_container_diagnostics(context: &str) {
+    warn!(
+        context,
+        version = %apple_container_command_snapshot(&["--version"]),
+        system_status = %apple_container_command_snapshot(&["system", "status"]),
+        images = %apple_container_command_snapshot(&["image", "ls"]),
+        "Apple Container diagnostics"
+    );
 }
 
 fn browser_container_name_prefix(container_prefix: &str) -> String {
@@ -194,6 +256,62 @@ fn ensure_profile_dir(dir: &Path) {
     }
 }
 
+fn remove_stale_profile_singletons(dir: &Path) {
+    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => match std::fs::remove_file(&path) {
+                Ok(()) => debug!(path = %path.display(), "removed stale browser profile singleton"),
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to remove stale browser profile singleton"
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "failed to inspect browser profile singleton"
+            ),
+        }
+    }
+}
+
+fn lock_profile_dir(dir: &Path) -> Result<File> {
+    let lock_path = dir.join(".moltis.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open profile lock at {}", lock_path.display()))?;
+
+    lock.try_lock().map_err(|error| {
+        let message = match error {
+            std::fs::TryLockError::WouldBlock => format!(
+                "browser profile at {} is already in use by another Moltis browser container",
+                dir.display()
+            ),
+            std::fs::TryLockError::Error(error) => format!(
+                "failed to lock browser profile at {}: {error}",
+                dir.display()
+            ),
+        };
+        Error::LaunchFailed(message)
+    })?;
+
+    Ok(lock)
+}
+
+fn prepare_browserless_v2_profile(dir: &Path) -> Result<File> {
+    ensure_profile_dir(dir);
+    let lock = lock_profile_dir(dir)?;
+    remove_stale_profile_singletons(dir);
+    Ok(lock)
+}
+
 #[cfg(unix)]
 fn set_container_dir_permissions(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -235,62 +353,6 @@ impl ContainerBackend {
     }
 }
 
-fn stop_container_by_id(backend: ContainerBackend, container_id: &str) {
-    let cli = backend.cli();
-    let result = Command::new(cli).args(["stop", container_id]).output();
-
-    match result {
-        Ok(output) if output.status.success() => {
-            debug!(container_id, backend = cli, "browser container stopped");
-        },
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(
-                container_id,
-                backend = cli,
-                error = %stderr.trim(),
-                "failed to stop browser container"
-            );
-        },
-        Err(e) => {
-            warn!(
-                container_id,
-                backend = cli,
-                error = %e,
-                "failed to run {} stop",
-                cli
-            );
-        },
-    }
-
-    // Containers are started without --rm so that logs and status remain
-    // available for diagnostics after a crash.  Explicitly remove the
-    // container after stopping it.
-    match Command::new(cli).args(["rm", container_id]).output() {
-        Ok(output) if output.status.success() => {
-            debug!(container_id, backend = cli, "browser container removed");
-        },
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(
-                container_id,
-                backend = cli,
-                error = %stderr.trim(),
-                "failed to remove browser container"
-            );
-        },
-        Err(e) => {
-            warn!(
-                container_id,
-                backend = cli,
-                error = %e,
-                "failed to run {} rm",
-                cli
-            );
-        },
-    }
-}
-
 /// A running browser container instance.
 pub struct BrowserContainer {
     /// Container ID or name.
@@ -299,6 +361,12 @@ pub struct BrowserContainer {
     host_port: u16,
     /// Hostname or IP used to connect to the container.
     host: String,
+    /// Version-aware WebSocket URL, including Browserless v2 launch options.
+    websocket_url: String,
+    /// Exclusive profile lock held for the lifetime of a Browserless v2 container.
+    _profile_lock: Option<File>,
+    /// Whether the backend confirmed that this container stopped or was removed.
+    cleanup_confirmed: AtomicBool,
     /// The image used.
     #[allow(dead_code)]
     image: String,
@@ -325,8 +393,35 @@ impl BrowserContainer {
         host_data_dir: Option<&Path>,
         container_host: &str,
     ) -> Result<Self> {
+        Self::start_with_api_version(
+            image,
+            container_prefix,
+            viewport_width,
+            viewport_height,
+            low_memory_threshold_mb,
+            session_timeout_ms,
+            profile_dir,
+            host_data_dir,
+            container_host,
+            BrowserlessApiVersion::V1,
+        )
+    }
+
+    /// Start a new browser container for a specific Browserless API version.
+    pub fn start_with_api_version(
+        image: &str,
+        container_prefix: &str,
+        viewport_width: u32,
+        viewport_height: u32,
+        low_memory_threshold_mb: u64,
+        session_timeout_ms: u64,
+        profile_dir: Option<&Path>,
+        host_data_dir: Option<&Path>,
+        container_host: &str,
+        browserless_api_version: BrowserlessApiVersion,
+    ) -> Result<Self> {
         let backend = detect_backend()?;
-        Self::start_with_backend(
+        Self::start_with_backend_and_api_version(
             backend,
             image,
             container_prefix,
@@ -337,6 +432,7 @@ impl BrowserContainer {
             profile_dir,
             host_data_dir,
             container_host,
+            browserless_api_version,
         )
     }
 
@@ -352,6 +448,36 @@ impl BrowserContainer {
         profile_dir: Option<&Path>,
         host_data_dir: Option<&Path>,
         container_host: &str,
+    ) -> Result<Self> {
+        Self::start_with_backend_and_api_version(
+            backend,
+            image,
+            container_prefix,
+            viewport_width,
+            viewport_height,
+            low_memory_threshold_mb,
+            session_timeout_ms,
+            profile_dir,
+            host_data_dir,
+            container_host,
+            BrowserlessApiVersion::V1,
+        )
+    }
+
+    /// Start a new browser container with a specific backend and API version.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_backend_and_api_version(
+        backend: ContainerBackend,
+        image: &str,
+        container_prefix: &str,
+        viewport_width: u32,
+        viewport_height: u32,
+        low_memory_threshold_mb: u64,
+        session_timeout_ms: u64,
+        profile_dir: Option<&Path>,
+        host_data_dir: Option<&Path>,
+        container_host: &str,
+        browserless_api_version: BrowserlessApiVersion,
     ) -> Result<Self> {
         use std::time::Instant;
 
@@ -370,16 +496,45 @@ impl BrowserContainer {
             host_port,
             backend = backend.cli(),
             container_host,
+            browserless_api_version = %browserless_api_version,
             "starting browser container"
         );
 
         let t0 = Instant::now();
         let profile_mount_dir =
             profile_dir.map(|dir| profile_mount_dir_for_backend(backend, dir, host_data_dir));
+        let container_profile_dir = profile_mount_dir.as_ref().map(|_| CONTAINER_PROFILE_PATH);
+        let launch_args = build_container_launch_args(
+            viewport_width,
+            viewport_height,
+            low_memory_threshold_mb,
+            container_profile_dir,
+            backend,
+        );
+        let websocket_url = browserless::websocket_url(
+            container_host,
+            host_port,
+            browserless_api_version,
+            &launch_args,
+        )?;
 
-        if let Some(guest_dir) = profile_precreate_dir(profile_dir, profile_mount_dir.as_deref()) {
-            ensure_profile_dir(guest_dir);
-        }
+        let mut profile_lock = match browserless_api_version {
+            BrowserlessApiVersion::V1 => {
+                if let Some(guest_dir) =
+                    profile_precreate_dir(profile_dir, profile_mount_dir.as_deref())
+                {
+                    ensure_profile_dir(guest_dir);
+                }
+                None
+            },
+            BrowserlessApiVersion::V2 => {
+                if let Some(guest_dir) = profile_dir {
+                    Some(prepare_browserless_v2_profile(guest_dir)?)
+                } else {
+                    None
+                }
+            },
+        };
 
         let container_id = match backend {
             ContainerBackend::Docker | ContainerBackend::Podman => start_oci_container(
@@ -387,10 +542,9 @@ impl BrowserContainer {
                 image,
                 container_prefix,
                 host_port,
-                viewport_width,
-                viewport_height,
-                low_memory_threshold_mb,
                 session_timeout_ms,
+                browserless_api_version,
+                &launch_args,
                 profile_mount_dir.as_deref(),
             )?,
             #[cfg(target_os = "macos")]
@@ -398,10 +552,9 @@ impl BrowserContainer {
                 image,
                 container_prefix,
                 host_port,
-                viewport_width,
-                viewport_height,
-                low_memory_threshold_mb,
                 session_timeout_ms,
+                browserless_api_version,
+                &launch_args,
                 profile_mount_dir.as_deref(),
             )?,
         };
@@ -471,7 +624,10 @@ impl BrowserContainer {
                 );
             }
 
-            stop_container_by_id(backend, &container_id);
+            let cleanup_confirmed = stop_container_by_id(backend, &container_id);
+            if let Some(lock) = profile_lock_to_quarantine(profile_lock.take(), cleanup_confirmed) {
+                quarantine_profile_lock(lock, backend, &container_id, profile_dir);
+            }
             if let Some(hint) = permission_hint {
                 return Err(launch_error_with_hint(error, hint));
             }
@@ -490,6 +646,9 @@ impl BrowserContainer {
             container_id,
             host_port,
             host: container_host.to_string(),
+            websocket_url,
+            _profile_lock: profile_lock,
+            cleanup_confirmed: AtomicBool::new(false),
             image: image.to_string(),
             backend,
         })
@@ -498,8 +657,7 @@ impl BrowserContainer {
     /// Get the WebSocket URL for CDP connection.
     #[must_use]
     pub fn websocket_url(&self) -> String {
-        // browserless/chrome provides a direct WebSocket endpoint
-        format!("ws://{}:{}", self.host, self.host_port)
+        self.websocket_url.clone()
     }
 
     /// Get the HTTP URL for health checks.
@@ -510,12 +668,17 @@ impl BrowserContainer {
 
     /// Stop and remove the container.
     pub fn stop(&self) {
+        if self.cleanup_confirmed.load(Ordering::Relaxed) {
+            return;
+        }
         info!(
             container_id = %self.container_id,
             backend = self.backend.cli(),
             "stopping browser container"
         );
-        stop_container_by_id(self.backend, &self.container_id);
+        if stop_container_by_id(self.backend, &self.container_id) {
+            self.cleanup_confirmed.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Get the container ID.
@@ -534,13 +697,18 @@ impl BrowserContainer {
 impl Drop for BrowserContainer {
     fn drop(&mut self) {
         self.stop();
+        if !self.cleanup_confirmed.load(Ordering::Relaxed)
+            && let Some(lock) = profile_lock_to_quarantine(self._profile_lock.take(), false)
+        {
+            quarantine_profile_lock(lock, self.backend, &self.container_id, None);
+        }
     }
 }
 
 /// Path inside the container where the browser profile is mounted.
 const CONTAINER_PROFILE_PATH: &str = "/data/browser-profile";
 
-/// Build the `DEFAULT_LAUNCH_ARGS` env-var value for containerised Chrome.
+/// Build launch arguments for containerised Chrome.
 ///
 /// Always includes `--window-size`; appends low-memory flags when the host
 /// system RAM is below the given threshold. Adds `--user-data-dir` when a
@@ -551,7 +719,7 @@ fn build_container_launch_args(
     low_memory_threshold_mb: u64,
     container_profile_dir: Option<&str>,
     backend: ContainerBackend,
-) -> String {
+) -> Vec<String> {
     use crate::pool::low_memory_chrome_args;
 
     let mut args = vec![format!("--window-size={viewport_width},{viewport_height}")];
@@ -578,40 +746,7 @@ fn build_container_launch_args(
         }
     }
 
-    let joined = args
-        .iter()
-        .map(|a| format!("\"{a}\""))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("DEFAULT_LAUNCH_ARGS=[{joined}]")
-}
-
-/// Compute the browserless container `TIMEOUT` (in ms) from pool lifecycle settings.
-///
-/// The result is `max(idle_timeout_secs, max_instance_lifetime_secs)` converted
-/// to milliseconds, then floored against `navigation_timeout_ms` so that a single
-/// long navigation cannot exceed the container's own timeout. The final value is
-/// capped at `max_instance_lifetime_secs * 1000` to prevent disagree­ment with the
-/// Moltis-side hard TTL when `navigation_timeout_ms` is very large.
-pub(crate) fn browserless_session_timeout_ms(
-    idle_timeout_secs: u64,
-    navigation_timeout_ms: u64,
-    max_instance_lifetime_secs: u64,
-) -> u64 {
-    let ceiling_ms = max_instance_lifetime_secs.saturating_mul(1000);
-    idle_timeout_secs
-        .max(max_instance_lifetime_secs)
-        .saturating_mul(1000)
-        .max(navigation_timeout_ms)
-        .min(ceiling_ms)
-}
-
-fn browserless_container_env(session_timeout_ms: u64) -> Vec<String> {
-    vec![
-        format!("TIMEOUT={session_timeout_ms}"),
-        "MAX_CONCURRENT_SESSIONS=1".to_string(),
-        "PREBOOT_CHROME=true".to_string(),
-    ]
+    args
 }
 
 /// Start a Docker container for the browser.
@@ -620,24 +755,16 @@ fn start_oci_container(
     image: &str,
     container_prefix: &str,
     host_port: u16,
-    viewport_width: u32,
-    viewport_height: u32,
-    low_memory_threshold_mb: u64,
     session_timeout_ms: u64,
+    browserless_api_version: BrowserlessApiVersion,
+    launch_args: &[String],
     profile_dir: Option<&Path>,
 ) -> Result<String> {
     let cli = backend.cli();
     let container_name = new_browser_container_name(container_prefix);
 
-    let container_profile_dir = profile_dir.map(|_| CONTAINER_PROFILE_PATH);
-    let launch_args = build_container_launch_args(
-        viewport_width,
-        viewport_height,
-        low_memory_threshold_mb,
-        container_profile_dir,
-        backend,
-    );
-    let browserless_env = browserless_container_env(session_timeout_ms);
+    let browserless_env =
+        browserless::container_env(browserless_api_version, session_timeout_ms, launch_args)?;
 
     let mut run_args = vec![
         "run".to_string(),
@@ -646,8 +773,6 @@ fn start_oci_container(
         container_name.clone(),
         "-p".to_string(),
         format!("{}:3000", host_port),
-        "-e".to_string(),
-        launch_args,
         "--shm-size=2gb".to_string(),
     ];
 
@@ -702,23 +827,15 @@ fn start_apple_container(
     image: &str,
     container_prefix: &str,
     host_port: u16,
-    viewport_width: u32,
-    viewport_height: u32,
-    low_memory_threshold_mb: u64,
     session_timeout_ms: u64,
+    browserless_api_version: BrowserlessApiVersion,
+    launch_args: &[String],
     profile_dir: Option<&Path>,
 ) -> Result<String> {
     let container_name = new_browser_container_name(container_prefix);
 
-    let container_profile_dir = profile_dir.map(|_| CONTAINER_PROFILE_PATH);
-    let launch_args = build_container_launch_args(
-        viewport_width,
-        viewport_height,
-        low_memory_threshold_mb,
-        container_profile_dir,
-        ContainerBackend::AppleContainer,
-    );
-    let browserless_env = browserless_container_env(session_timeout_ms);
+    let browserless_env =
+        browserless::container_env(browserless_api_version, session_timeout_ms, launch_args)?;
 
     let mut container_args = vec![
         "run".to_string(),
@@ -727,8 +844,6 @@ fn start_apple_container(
         container_name.clone(),
         "-p".to_string(),
         format!("{}:3000", host_port),
-        "-e".to_string(),
-        launch_args,
         // Chrome requires shared memory for rendering; Docker uses --shm-size=2gb,
         // Apple Container doesn't support --shm-size so mount tmpfs at /dev/shm.
         "--tmpfs".to_string(),
@@ -1217,6 +1332,23 @@ pub fn cleanup_stale_browser_containers(container_prefix: &str) -> Result<usize>
 pub fn ensure_image(image: &str) -> Result<()> {
     let backend = detect_backend()?;
 
+    #[cfg(target_os = "macos")]
+    if backend == ContainerBackend::AppleContainer
+        && moltis_config::apple_container_marked_unhealthy()
+    {
+        if is_docker_available() {
+            warn!(
+                image,
+                "Apple Container marked unhealthy after an earlier failure; using Docker for browser image"
+            );
+            return ensure_image_with_backend(ContainerBackend::Docker, image);
+        }
+        return Err(Error::LaunchFailed(
+            "Apple Container is marked unhealthy after an earlier failure and Docker is unavailable"
+                .to_string(),
+        ));
+    }
+
     // Try primary backend first
     let result = ensure_image_with_backend(backend, image);
 
@@ -1224,7 +1356,10 @@ pub fn ensure_image(image: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     if result.is_err() && backend == ContainerBackend::AppleContainer && is_docker_available() {
         if let Err(ref e) = result {
+            moltis_config::mark_apple_container_unhealthy();
+            log_apple_container_diagnostics("browser image pull fallback");
             warn!(
+                image,
                 error = %e,
                 "Apple Container image pull failed, falling back to Docker"
             );
@@ -1258,22 +1393,63 @@ pub fn ensure_image_with_backend(backend: ContainerBackend, image: &str) -> Resu
 
     info!(image, backend = cli, "pulling browser container image");
 
-    let output = match backend {
+    let pull_args = match backend {
         ContainerBackend::Docker | ContainerBackend::Podman => {
-            Command::new(cli).args(["pull", image]).output()
+            vec!["pull".to_string(), image.to_string()]
         },
         #[cfg(target_os = "macos")]
         ContainerBackend::AppleContainer => {
-            Command::new(cli).args(["image", "pull", image]).output()
+            vec![
+                "image".to_string(),
+                "pull".to_string(),
+                "--progress".to_string(),
+                "plain".to_string(),
+                "--max-concurrent-downloads".to_string(),
+                "1".to_string(),
+                "--platform".to_string(),
+                "linux/arm64".to_string(),
+                image.to_string(),
+            ]
         },
+    };
+    let command = command_display(cli, &pull_args);
+    debug!(image, backend = cli, command = %command, "running browser image pull command");
+
+    #[cfg(target_os = "macos")]
+    let _apple_container_lock = (backend == ContainerBackend::AppleContainer)
+        .then(moltis_config::apple_container_operation_lock);
+
+    #[cfg(target_os = "macos")]
+    if backend == ContainerBackend::AppleContainer
+        && moltis_config::apple_container_marked_unhealthy()
+    {
+        return Err(Error::LaunchFailed(
+            "Apple Container is marked unhealthy after an earlier failure".to_string(),
+        ));
     }
-    .context("failed to pull image")?;
+
+    let output = Command::new(cli)
+        .args(&pull_args)
+        .output()
+        .context("failed to pull image")?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout_tail = output_tail(&output.stdout, 4000);
+        let stderr_tail = output_tail(&output.stderr, 4000);
+        warn!(
+            image,
+            backend = cli,
+            command = %command,
+            status = %status_display(&output),
+            stdout_tail = %stdout_tail,
+            stderr_tail = %stderr_tail,
+            "browser container image pull command failed"
+        );
         return Err(Error::LaunchFailed(format!(
-            "failed to pull browser image: {}",
-            stderr.trim()
+            "failed to pull browser image with `{command}`: status={}, stderr={}, stdout={}",
+            status_display(&output),
+            stderr_tail,
+            stdout_tail
         )));
     }
 

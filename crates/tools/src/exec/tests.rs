@@ -19,12 +19,22 @@ impl TestBroadcaster {
     }
 }
 
-#[test]
-fn truncate_output_for_display_handles_multibyte_boundary() {
-    let mut output = format!("{}л{}", "a".repeat(1999), "z".repeat(10));
-    truncate_output_for_display(&mut output, 2000);
+#[tokio::test]
+async fn limited_output_handles_multibyte_boundary() {
+    let input = format!("{}л{}", "a".repeat(1999), "z".repeat(10));
+    let output = read_output_limited(input.as_bytes(), 2000).await.unwrap();
     assert!(output.contains("[output truncated]"));
     assert!(!output.contains('л'));
+}
+
+#[tokio::test]
+async fn limited_output_caps_lossy_utf8_expansion() {
+    const LIMIT: usize = 10;
+    const MARKER: &str = "\n... [output truncated]";
+    let input = [0xff_u8; 100];
+    let output = read_output_limited(input.as_slice(), LIMIT).await.unwrap();
+    assert!(output.ends_with(MARKER));
+    assert!(output.len() <= LIMIT + MARKER.len());
 }
 
 #[async_trait]
@@ -50,6 +60,55 @@ async fn test_exec_echo() {
     assert_eq!(result.exit_code, 0);
 }
 
+#[test]
+fn host_exec_injects_the_resolved_moltis_data_dir() {
+    let mut env = vec![("MOLTIS_DATA_DIR".to_owned(), "stale".to_owned())];
+    inject_moltis_data_dir(&mut env, true);
+
+    assert_eq!(env, vec![(
+        "MOLTIS_DATA_DIR".to_owned(),
+        moltis_config::data_dir().to_string_lossy().into_owned(),
+    )]);
+}
+
+#[test]
+fn host_exec_injects_the_resolved_managed_files_dir() {
+    let mut env = vec![("MOLTIS_FILES_DIR".to_owned(), "stale".to_owned())];
+    inject_moltis_files_dir(
+        &mut env,
+        Some(
+            moltis_config::managed_files_dir()
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+
+    assert_eq!(env, vec![(
+        "MOLTIS_FILES_DIR".to_owned(),
+        moltis_config::managed_files_dir()
+            .to_string_lossy()
+            .into_owned(),
+    )]);
+}
+
+#[test]
+fn sandbox_exec_injects_the_guest_managed_files_dir() {
+    let mut env = Vec::new();
+    inject_moltis_files_dir(&mut env, Some(crate::sandbox::SANDBOX_FILES_DIR.to_owned()));
+
+    assert_eq!(env, vec![(
+        "MOLTIS_FILES_DIR".to_owned(),
+        crate::sandbox::SANDBOX_FILES_DIR.to_owned(),
+    )]);
+}
+
+#[test]
+fn unsupported_sandbox_omits_the_managed_files_dir() {
+    let mut env = vec![("MOLTIS_FILES_DIR".to_owned(), "stale".to_owned())];
+    inject_moltis_files_dir(&mut env, None);
+    assert!(env.is_empty());
+}
+
 #[tokio::test]
 async fn test_exec_stderr() {
     let result = exec_command("echo err >&2", &ExecOpts::default())
@@ -72,6 +131,21 @@ async fn test_exec_timeout() {
     };
     let result = exec_command("sleep 10", &opts).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_exec_timeout_kills_before_later_side_effect() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let marker = temp_dir.path().join("should-not-exist");
+    let command = format!("(sleep 1; touch '{}') & wait", marker.display());
+    let opts = ExecOpts {
+        timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+
+    assert!(exec_command(&command, &opts).await.is_err());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(!marker.exists(), "timed-out descendant continued running");
 }
 
 #[tokio::test]
@@ -102,6 +176,21 @@ async fn test_exec_tool_empty_working_dir() {
         .unwrap();
     assert_eq!(result["exit_code"], 0);
     assert!(!result["stdout"].as_str().unwrap().trim().is_empty());
+}
+
+#[tokio::test]
+async fn test_exec_tool_uses_internal_working_dir_default() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let tool = ExecTool::default();
+    let result = tool
+        .execute(serde_json::json!({
+            "command": "pwd",
+            "_working_dir": temp_dir.path(),
+        }))
+        .await
+        .unwrap();
+    let reported = std::fs::canonicalize(result["stdout"].as_str().unwrap().trim()).unwrap();
+    assert_eq!(reported, temp_dir.path().canonicalize().unwrap());
 }
 
 #[tokio::test]
@@ -960,6 +1049,122 @@ impl NodeExecProvider for DisconnectedNodeProvider {
     }
 }
 
+/// Connected provider used to verify explicit node clearing does not route remotely.
+struct ConnectedNodeProvider;
+
+#[async_trait]
+impl NodeExecProvider for ConnectedNodeProvider {
+    async fn exec_on_node(
+        &self,
+        _node_id: &str,
+        _command: &str,
+        _timeout_secs: u64,
+        _cwd: Option<&str>,
+        _env: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<ExecResult> {
+        unreachable!("explicit null node must use local execution");
+    }
+
+    async fn resolve_node_id(&self, _node_ref: &str) -> Option<String> {
+        Some("connected-node".into())
+    }
+
+    fn has_connected_nodes(&self) -> bool {
+        true
+    }
+
+    async fn default_node_ref(&self) -> Option<String> {
+        Some("connected-node".into())
+    }
+}
+
+struct RecordingNodeProvider {
+    called: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl NodeExecProvider for RecordingNodeProvider {
+    async fn exec_on_node(
+        &self,
+        _node_id: &str,
+        _command: &str,
+        _timeout_secs: u64,
+        _cwd: Option<&str>,
+        _env: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<ExecResult> {
+        self.called.store(true, Ordering::SeqCst);
+        Ok(ExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        })
+    }
+
+    async fn resolve_node_id(&self, _node_ref: &str) -> Option<String> {
+        Some("connected-node".into())
+    }
+
+    fn has_connected_nodes(&self) -> bool {
+        true
+    }
+
+    async fn default_node_ref(&self) -> Option<String> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn test_remote_exec_checks_approval_before_forwarding() {
+    let called = Arc::new(AtomicBool::new(false));
+    let mut manager = ApprovalManager::default();
+    manager.security_level = crate::approval::SecurityLevel::Deny;
+    let manager = Arc::new(manager);
+    let broadcaster: Arc<dyn ApprovalBroadcaster> = Arc::new(TestBroadcaster::new());
+    let tool = ExecTool::default()
+        .with_node_provider(
+            Arc::new(RecordingNodeProvider {
+                called: Arc::clone(&called),
+            }),
+            None,
+        )
+        .with_approval(manager, broadcaster);
+
+    let error = tool
+        .execute(serde_json::json!({
+            "command": "printf '%s' 'not forwarded'",
+            "node": "connected-node",
+        }))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("security level is 'deny'"));
+    assert!(!called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_exec_null_node_clears_configured_default() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let tool = ExecTool {
+        working_dir: Some(temp_dir.path().to_path_buf()),
+        ..Default::default()
+    }
+    .with_node_provider(
+        Arc::new(ConnectedNodeProvider),
+        Some("configured-node".into()),
+    );
+
+    let result = tool
+        .execute(serde_json::json!({
+            "command": "echo local",
+            "node": null
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(result["stdout"].as_str().unwrap().trim(), "local");
+    assert_eq!(result["exit_code"], 0);
+}
+
 #[tokio::test]
 async fn test_exec_ignores_node_param_when_no_nodes_connected() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1031,6 +1236,17 @@ async fn test_exec_schema_hides_node_when_no_nodes_connected() {
     assert!(
         !props.contains_key("node"),
         "node param should be hidden when no nodes are connected"
+    );
+}
+
+#[tokio::test]
+async fn test_exec_schema_allows_explicit_null_node_when_connected() {
+    let tool = ExecTool::default().with_node_provider(Arc::new(ConnectedNodeProvider), None);
+
+    let schema = tool.parameters_schema();
+    assert_eq!(
+        schema["properties"]["node"]["type"],
+        serde_json::json!(["string", "null"])
     );
 }
 

@@ -17,6 +17,16 @@ use super::super::*;
 
 pub struct NoopSkillsService;
 
+fn snyk_agent_scan_status_payload(installed_dir: &Path, uvx_available: bool) -> Value {
+    serde_json::json!({
+        "mcp_scan_available": false,
+        "uvx_available": uvx_available,
+        "supported": uvx_available,
+        "installed_skills_dir": installed_dir,
+        "install_hint": "Install uv (https://docs.astral.sh/uv/) to run Snyk Agent Scan skill security scans",
+    })
+}
+
 #[async_trait]
 impl SkillsService for NoopSkillsService {
     async fn status(&self) -> ServiceResult {
@@ -978,15 +988,11 @@ impl SkillsService for NoopSkillsService {
     async fn security_status(&self) -> ServiceResult {
         let installed_dir =
             moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
-        let mcp_scan_available = command_available("mcp-scan").await;
-        let uvx_available = command_available("uvx").await;
-        Ok(serde_json::json!({
-            "mcp_scan_available": mcp_scan_available,
-            "uvx_available": uvx_available,
-            "supported": mcp_scan_available || uvx_available,
-            "installed_skills_dir": installed_dir,
-            "install_hint": "Install uv (https://docs.astral.sh/uv/) or mcp-scan to run skill security scans",
-        }))
+        let uvx_available = command_available(UVX_EXECUTABLE).await;
+        Ok(snyk_agent_scan_status_payload(
+            &installed_dir,
+            uvx_available,
+        ))
     }
 
     async fn security_scan(&self) -> ServiceResult {
@@ -1006,10 +1012,12 @@ impl SkillsService for NoopSkillsService {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if !supported {
-            return Err("mcp-scan is not available. Install uvx or mcp-scan binary first".into());
+            return Err(
+                "Snyk Agent Scan requires uv. Install uv (https://docs.astral.sh/uv/) first".into(),
+            );
         }
 
-        let results = run_mcp_scan(&installed_dir)
+        let results = run_snyk_agent_scan(&installed_dir)
             .await
             .map_err(ServiceError::message)?;
         security_audit(
@@ -1045,81 +1053,64 @@ impl SkillsService for NoopSkillsService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'query' parameter".to_string())?;
         let client = moltis_skills::clawhub::ClawHubClient::new();
-        let response = client.search(query).await.map_err(ServiceError::message)?;
-
-        // Enrich results with stats from skill info. Use a semaphore to limit
-        // concurrent requests (avoid hitting ClawHub's 180 req/min rate limit).
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
-        let futs: Vec<_> = response
-            .results
-            .iter()
-            .map(|r| {
-                let slug = r.slug.clone();
-                let client = moltis_skills::clawhub::ClawHubClient::new();
-                let sem = Arc::clone(&semaphore);
-                async move {
-                    let _permit = sem.acquire().await;
-                    (slug.clone(), client.skill_info(&slug).await.ok())
-                }
-            })
-            .collect();
-        let infos = futures::future::join_all(futs).await;
-
-        let enriched: Vec<EnrichedSearchResult> = response
-            .results
-            .into_iter()
-            .map(|r| {
-                let mut e = EnrichedSearchResult::from(r.clone());
-                if let Some((_, Some(info))) = infos.iter().find(|(s, _)| *s == r.slug) {
-                    if let Some(stats) = &info.skill.stats {
-                        e.downloads = stats.downloads;
-                        e.stars = stats.stars;
-                    }
-                    if let Some(owner) = &info.owner {
-                        e.owner_handle = owner.handle.clone();
-                        e.owner_image = owner.image.clone();
-                    }
-                }
-                e
-            })
-            .collect();
+        let response = match client.search(query).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%error, "ClawHub search failed");
+                return Err(ServiceError::message(error));
+            },
+        };
+        tracing::debug!(
+            result_count = response.results.len(),
+            "ClawHub search completed"
+        );
+        let enriched: Vec<EnrichedSearchResult> =
+            response.results.into_iter().map(Into::into).collect();
 
         Ok(serde_json::json!({ "results": enriched }))
     }
 
     async fn clawhub_scan(&self, params: Value) -> ServiceResult {
-        let slug = params
-            .get("slug")
+        let reference = params
+            .get("reference")
+            .or_else(|| params.get("slug"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'slug' parameter".to_string())?;
-        moltis_skills::clawhub::validate_slug(slug).map_err(ServiceError::message)?;
+            .ok_or_else(|| "missing 'reference' parameter".to_string())?;
+        let skill_ref = moltis_skills::clawhub::parse_skill_reference(reference)
+            .map_err(ServiceError::message)?;
         let client = moltis_skills::clawhub::ClawHubClient::new();
-        let scan = client.scan(slug).await.map_err(ServiceError::message)?;
+        let scan = client
+            .scan(skill_ref.slug, skill_ref.owner_handle)
+            .await
+            .map_err(ServiceError::message)?;
         Ok(serde_json::to_value(scan).unwrap_or_default())
     }
 
     async fn clawhub_info(&self, params: Value) -> ServiceResult {
-        let slug = params
-            .get("slug")
+        let reference = params
+            .get("reference")
+            .or_else(|| params.get("slug"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'slug' parameter".to_string())?;
-        moltis_skills::clawhub::validate_slug(slug).map_err(ServiceError::message)?;
+            .ok_or_else(|| "missing 'reference' parameter".to_string())?;
+        let skill_ref = moltis_skills::clawhub::parse_skill_reference(reference)
+            .map_err(ServiceError::message)?;
         let client = moltis_skills::clawhub::ClawHubClient::new();
         let info = client
-            .skill_info(slug)
+            .skill_info(skill_ref.slug, skill_ref.owner_handle)
             .await
             .map_err(ServiceError::message)?;
         Ok(serde_json::to_value(info).unwrap_or_default())
     }
 
     async fn clawhub_install(&self, params: Value) -> ServiceResult {
-        let slug = params
-            .get("slug")
+        let reference = params
+            .get("reference")
+            .or_else(|| params.get("slug"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'slug' parameter".to_string())?;
+            .ok_or_else(|| "missing 'reference' parameter".to_string())?;
         let install_dir =
             moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
-        let skills = moltis_skills::clawhub::install_from_clawhub(slug, &install_dir)
+        let skills = moltis_skills::clawhub::install_from_clawhub(reference, &install_dir)
             .await
             .map_err(ServiceError::message)?;
         let installed: Vec<_> = skills
@@ -1134,7 +1125,7 @@ impl SkillsService for NoopSkillsService {
             .collect();
         security_audit(
             "skills.clawhub.install",
-            serde_json::json!({ "slug": slug, "installed_count": installed.len() }),
+            serde_json::json!({ "reference": reference, "installed_count": installed.len() }),
         );
         Ok(serde_json::json!({ "installed": installed }))
     }
@@ -1142,14 +1133,24 @@ impl SkillsService for NoopSkillsService {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, serial_test::serial};
+    use {super::*, serial_test::serial, std::path::PathBuf};
 
-    struct ConfigDirGuard;
+    struct ConfigDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl Drop for ConfigDirGuard {
         fn drop(&mut self) {
             moltis_config::clear_config_dir();
         }
+    }
+
+    fn set_test_config_dir(path: PathBuf) -> ConfigDirGuard {
+        let guard = ConfigDirGuard {
+            _lock: crate::config_override_test_lock(),
+        };
+        moltis_config::set_config_dir(path);
+        guard
     }
 
     #[test]
@@ -1165,13 +1166,27 @@ mod tests {
         assert_eq!(risky_install_pattern("cargo install ripgrep"), None);
     }
 
+    #[test]
+    fn snyk_agent_scan_status_depends_only_on_uvx() {
+        let installed_dir = Path::new("/tmp/installed skills");
+
+        let unavailable = snyk_agent_scan_status_payload(installed_dir, false);
+        assert_eq!(unavailable["mcp_scan_available"], false);
+        assert_eq!(unavailable["uvx_available"], false);
+        assert_eq!(unavailable["supported"], false);
+
+        let available = snyk_agent_scan_status_payload(installed_dir, true);
+        assert_eq!(available["mcp_scan_available"], false);
+        assert_eq!(available["uvx_available"], true);
+        assert_eq!(available["supported"], true);
+    }
+
     #[cfg(feature = "bundled-skills")]
     #[tokio::test]
     #[serial]
     async fn disabling_one_bundled_skill_does_not_disable_category() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        moltis_config::set_config_dir(dir.path().to_path_buf());
-        let _guard = ConfigDirGuard;
+        let _guard = set_test_config_dir(dir.path().to_path_buf());
 
         let service = NoopSkillsService;
         let result = service
@@ -1206,8 +1221,7 @@ mod tests {
     #[serial]
     async fn bundled_category_toggle_preserves_individual_disables() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        moltis_config::set_config_dir(dir.path().to_path_buf());
-        let _guard = ConfigDirGuard;
+        let _guard = set_test_config_dir(dir.path().to_path_buf());
 
         let service = NoopSkillsService;
         service

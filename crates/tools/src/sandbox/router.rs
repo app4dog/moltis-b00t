@@ -8,6 +8,7 @@ use std::{
 use {
     async_trait::async_trait,
     secrecy::ExposeSecret,
+    sha2::{Digest, Sha256},
     tokio::sync::RwLock,
     tracing::{debug, info, warn},
 };
@@ -26,7 +27,8 @@ use {
         file_system::{SandboxGrepOptions, SandboxListFilesResult, SandboxReadResult},
         platform::RestrictedHostSandbox,
         types::{
-            BuildImageResult, DEFAULT_SANDBOX_IMAGE, Sandbox, SandboxConfig, SandboxId, SandboxMode,
+            BuildImageResult, DEFAULT_SANDBOX_IMAGE, Sandbox, SandboxConfig, SandboxId,
+            SandboxMode, SandboxRuntimeInfo,
         },
     },
     crate::{
@@ -107,6 +109,19 @@ impl Sandbox for FailoverSandbox {
         }
     }
 
+    async fn runtime_name(&self, id: &SandboxId) -> Option<String> {
+        self.runtime_info(id).await.runtime_name
+    }
+
+    async fn runtime_info(&self, id: &SandboxId) -> SandboxRuntimeInfo {
+        let backend = if self.fallback_enabled().await {
+            Arc::clone(&self.fallback)
+        } else {
+            Arc::clone(&self.primary)
+        };
+        backend.runtime_info(id).await
+    }
+
     fn provides_fs_isolation(&self) -> bool {
         // On lock contention, conservatively report the fallback's (weaker)
         // isolation level rather than the primary's.
@@ -119,6 +134,19 @@ impl Sandbox for FailoverSandbox {
             self.fallback.provides_fs_isolation()
         } else {
             self.primary.provides_fs_isolation()
+        }
+    }
+
+    fn exposes_managed_files(&self) -> bool {
+        if self
+            .use_fallback
+            .try_read()
+            .map(|guard| *guard)
+            .unwrap_or(true)
+        {
+            self.fallback.exposes_managed_files()
+        } else {
+            self.primary.exposes_managed_files()
         }
     }
 
@@ -880,22 +908,21 @@ impl SandboxRouter {
         self.agent_overrides.write().await.remove(session_key);
     }
 
-    /// Derive a SandboxId for a given session key.
-    /// The key is sanitized for use as a container name (only alphanumeric, dash, underscore, dot).
+    /// Derive a collision-resistant SandboxId for a given session key.
     pub fn sandbox_id_for(&self, session_key: &str) -> SandboxId {
-        let sanitized: String = session_key
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
+        let scope: &[u8] = match &self.config.scope {
+            super::types::SandboxScope::Session => b"session",
+            super::types::SandboxScope::Agent => b"agent",
+            super::types::SandboxScope::Shared => b"shared",
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"moltis-sandbox-id-v2\0");
+        hasher.update(scope);
+        hasher.update(b"\0");
+        hasher.update(session_key.as_bytes());
         SandboxId {
             scope: self.config.scope.clone(),
-            key: sanitized,
+            key: format!("v2-{:x}", hasher.finalize()),
         }
     }
 

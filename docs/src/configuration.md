@@ -97,7 +97,7 @@ enabled = true
 
 [providers.openai]
 enabled = true
-models = ["gpt-5.3", "gpt-5.2"]
+models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 stream_transport = "sse"        # "sse", "websocket", or "auto"
 
 [providers.gemini]
@@ -109,7 +109,7 @@ enabled = true
 models = ["qwen2.5-coder-7b-q4_k_m"]
 
 [chat]
-priority_models = ["gpt-5.2"]
+priority_models = ["gpt-5.6-sol"]
 ```
 
 See [Providers](providers.md) for the full list of supported providers and configuration options.
@@ -385,6 +385,8 @@ offered = ["slack"]
 [channels.slack.my-bot]
 bot_token = "xoxb-..."
 app_token = "xapp-..."
+# Optional. Defaults to Slack; set only for Slack-compatible proxies/gateways.
+api_base_url = "https://slack.com/api"
 dm_policy = "allowlist"
 allowlist = ["U123456789"]
 ```
@@ -465,6 +467,11 @@ All settings can be overridden via environment variables:
 | `MOLTIS_SERVER__BIND` | Server bind address override |
 | `MOLTIS_TOOLS__AGENT_TIMEOUT_SECS` | Agent run timeout override |
 | `MOLTIS_TOOLS__AGENT_MAX_ITERATIONS` | Agent loop iteration cap override |
+
+`MOLTIS_FILES_DIR` is different from these startup overrides: Moltis supplies
+it to local command agents and `exec` as the resolved
+[Managed Files](managed-files.md) path. Use it instead of assuming
+`<data_dir>/files`.
 
 ## CLI Flags
 

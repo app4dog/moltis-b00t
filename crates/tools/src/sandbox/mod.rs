@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 pub(crate) mod apple;
+pub(crate) mod container_name;
 pub(crate) mod containers;
 pub(crate) mod daytona;
 pub(crate) mod docker;
@@ -39,10 +40,12 @@ pub use vercel::{VercelSandbox, VercelSandboxConfig};
 #[cfg(feature = "wasm")]
 pub use wasm::WasmSandbox;
 pub use {
+    container_name::{apple_container_name, has_apple_container_prefix},
     containers::{
         ContainerBackend, ContainerDiskUsage, ContainerRunState, RunningContainer, SandboxImage,
         clean_all_containers, clean_sandbox_images, container_cli, container_disk_usage,
-        is_cli_available, list_running_containers, list_sandbox_images, remove_container,
+        is_cli_available, list_moltis_images, list_running_containers,
+        list_running_containers_for_prefixes, list_sandbox_images, remove_container,
         remove_sandbox_image, restart_container_daemon, sandbox_image_tag, stop_container,
     },
     daytona::{DaytonaSandbox, DaytonaSandboxConfig},
@@ -52,8 +55,8 @@ pub use {
     platform::{RestrictedHostSandbox, is_wasm_sandbox_available},
     router::{FailoverSandbox, SandboxEvent, SandboxRouter, auto_detect_backend, create_sandbox},
     types::{
-        BuildImageResult, DEFAULT_SANDBOX_IMAGE, HomePersistence, NetworkPolicy, ResourceLimits,
-        Sandbox, SandboxBackendId, SandboxConfig, SandboxId, SandboxMode, SandboxScope,
-        WorkspaceMount,
+        BuildImageResult, DEFAULT_SANDBOX_IMAGE, HomePersistence, ManagedFilesMount, NetworkPolicy,
+        ResourceLimits, SANDBOX_FILES_DIR, Sandbox, SandboxBackendId, SandboxConfig, SandboxId,
+        SandboxMode, SandboxRuntimeInfo, SandboxScope, WorkspaceMount,
     },
 };

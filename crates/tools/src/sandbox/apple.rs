@@ -2,32 +2,41 @@
 
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
 #[cfg(target_os = "macos")]
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[cfg(target_os = "macos")]
 use super::containers::{
-    apple_container_exec_args, apple_container_run_args, apple_container_status_from_inspect,
-    is_apple_container_daemon_stale_error, is_apple_container_exists_error,
-    is_apple_container_service_error, rebuildable_sandbox_image_tag, sandbox_image_dockerfile,
-    sandbox_image_exists, sandbox_image_tag, unmark_zombie,
+    ContainerRunState, apple_container_exec_args, apple_container_run_args,
+    apple_container_run_state_from_inspect, is_apple_container_daemon_stale_error,
+    is_apple_container_exists_error, is_apple_container_service_error,
+    rebuildable_sandbox_image_tag, sandbox_image_exists, unmark_zombie,
+    validate_apple_container_resource_limits,
 };
 #[cfg(target_os = "macos")]
 use super::host::provision_packages;
 #[cfg(target_os = "macos")]
 use super::paths::{
+    ManagedFilesPath, ensure_managed_files_host_dir, ensure_managed_files_none_mask_host_dir,
     ensure_sandbox_home_persistence_host_dir, resolve_home_persistence_guest_path_on_host,
-    resolve_workspace_guest_path_on_host,
+    resolve_managed_files_guest_path_on_host, resolve_workspace_guest_path_on_host,
 };
 #[cfg(target_os = "macos")]
 use super::types::{
-    BuildImageResult, DEFAULT_SANDBOX_IMAGE, NetworkPolicy, SANDBOX_HOME_DIR, Sandbox,
-    SandboxConfig, SandboxId, canonical_sandbox_packages, tail_lines, truncate_output_for_display,
+    BuildImageResult, DEFAULT_SANDBOX_IMAGE, ManagedFilesMount, NetworkPolicy, ResourceLimits,
+    SANDBOX_FILES_DIR, SANDBOX_HOME_DIR, Sandbox, SandboxConfig, SandboxId,
+    truncate_output_for_display,
 };
 #[cfg(target_os = "macos")]
 use crate::error::{Error, Result};
@@ -37,7 +46,7 @@ use crate::exec::{ExecOpts, ExecResult};
 use crate::sandbox::file_system::{
     SandboxListFilesResult, SandboxReadResult, command_list_files, command_read_file,
     command_write_file, native_host_list_files, native_host_read_file, native_host_write_file,
-    remap_host_list_result_to_guest,
+    permission_denied_payload, remap_host_list_result_to_guest,
 };
 
 /// Apple Container sandbox using the `container` CLI (macOS 26+, Apple Silicon).
@@ -45,6 +54,7 @@ use crate::sandbox::file_system::{
 pub struct AppleContainerSandbox {
     pub config: SandboxConfig,
     name_generations: RwLock<HashMap<String, u32>>,
+    container_policy_fingerprints: Mutex<HashMap<String, String>>,
     /// Cached host gateway IP for proxy routing in Trusted mode.
     host_gateway_cache: RwLock<Option<String>>,
 }
@@ -55,6 +65,7 @@ impl AppleContainerSandbox {
         Self {
             config,
             name_generations: RwLock::new(HashMap::new()),
+            container_policy_fingerprints: Mutex::new(HashMap::new()),
             host_gateway_cache: RwLock::new(None),
         }
     }
@@ -117,12 +128,18 @@ impl AppleContainerSandbox {
             .unwrap_or("moltis-sandbox")
     }
 
-    fn base_container_name(&self, id: &SandboxId) -> String {
-        format!("{}-{}", self.container_prefix(), id.key)
+    pub(crate) fn container_policy_fingerprint(&self) -> String {
+        format!(
+            "{:?}\0{:?}",
+            self.config.managed_files_mount, self.config.resource_limits
+        )
+    }
+
+    fn container_name_for_generation(&self, id: &SandboxId, generation: u32) -> String {
+        super::container_name::apple_container_name(self.container_prefix(), &id.key, generation)
     }
 
     pub(crate) async fn container_name(&self, id: &SandboxId) -> String {
-        let base = self.base_container_name(id);
         let generation = self
             .name_generations
             .read()
@@ -130,11 +147,7 @@ impl AppleContainerSandbox {
             .get(&id.key)
             .copied()
             .unwrap_or(0);
-        if generation == 0 {
-            base
-        } else {
-            format!("{base}-g{generation}")
-        }
+        self.container_name_for_generation(id, generation)
     }
 
     pub(crate) async fn bump_container_generation(&self, id: &SandboxId) -> String {
@@ -144,8 +157,7 @@ impl AppleContainerSandbox {
             *entry += 1;
             *entry
         };
-        let base = self.base_container_name(id);
-        let next_name = format!("{base}-g{next_generation}");
+        let next_name = self.container_name_for_generation(id, next_generation);
         warn!(
             session_key = %id.key,
             generation = next_generation,
@@ -168,6 +180,26 @@ impl AppleContainerSandbox {
         Ok(Some(format!("{}:{SANDBOX_HOME_DIR}", host_dir.display())))
     }
 
+    pub(crate) fn volumes(&self, id: &SandboxId) -> Result<Vec<String>> {
+        let mut volumes = self
+            .home_persistence_volume(id)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let managed_volume = match self.config.managed_files_mount {
+            ManagedFilesMount::None => {
+                let mask_dir =
+                    ensure_managed_files_none_mask_host_dir(&self.config, Some("container"))?;
+                format!("{}:{SANDBOX_FILES_DIR}:ro", mask_dir.display())
+            },
+            mode => {
+                let host_dir = ensure_managed_files_host_dir(&self.config, Some("container"))?;
+                format!("{}:{SANDBOX_FILES_DIR}:{mode}", host_dir.display())
+            },
+        };
+        volumes.push(managed_volume);
+        Ok(volumes)
+    }
+
     fn mounted_host_path(&self, id: &SandboxId, guest_path: &str) -> Option<std::path::PathBuf> {
         let guest_path = std::path::Path::new(guest_path);
         resolve_workspace_guest_path_on_host(&self.config, Some("container"), guest_path).or_else(
@@ -179,6 +211,14 @@ impl AppleContainerSandbox {
                     guest_path,
                 )
             },
+        )
+    }
+
+    fn managed_files_path(&self, guest_path: &str) -> ManagedFilesPath {
+        resolve_managed_files_guest_path_on_host(
+            &self.config,
+            Some("container"),
+            std::path::Path::new(guest_path),
         )
     }
 
@@ -198,23 +238,14 @@ impl AppleContainerSandbox {
             return Ok(requested_image.to_string());
         };
 
-        if requested_image == rebuild_tag {
-            info!(
-                image = requested_image,
-                "apple sandbox image missing locally, rebuilding on demand"
-            );
-        } else {
-            warn!(
-                requested = requested_image,
-                rebuilt = %rebuild_tag,
-                "requested apple sandbox image missing locally, using deterministic tag from current config"
-            );
-        }
-
-        let Some(result) = self.build_image(&base_image, &packages).await? else {
-            return Ok(requested_image.to_string());
-        };
-        Ok(result.tag)
+        warn!(
+            requested = requested_image,
+            deterministic_tag = %rebuild_tag,
+            base_image = %base_image,
+            package_count = packages.len(),
+            "requested apple sandbox prebuilt image missing locally; using base image and per-container provisioning"
+        );
+        Ok(base_image)
     }
 
     /// Check whether the `container` CLI is available.
@@ -288,9 +319,9 @@ impl AppleContainerSandbox {
             match output {
                 Ok(output) if output.status.success() => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    match apple_container_status_from_inspect(&stdout) {
-                        Some("running") => return Ok(()),
-                        Some("stopped") => {
+                    match apple_container_run_state_from_inspect(&stdout) {
+                        Some(ContainerRunState::Running) => return Ok(()),
+                        Some(ContainerRunState::Stopped | ContainerRunState::Exited) => {
                             return Err(Error::message(format!(
                                 "container {name} failed to stay running after startup"
                             )));
@@ -424,9 +455,9 @@ impl AppleContainerSandbox {
             return ContainerState::NotFound;
         }
 
-        match apple_container_status_from_inspect(&stdout) {
-            Some("running") => ContainerState::Running,
-            Some("stopped") => ContainerState::Stopped,
+        match apple_container_run_state_from_inspect(&stdout) {
+            Some(ContainerRunState::Running) => ContainerState::Running,
+            Some(ContainerRunState::Stopped | ContainerRunState::Exited) => ContainerState::Stopped,
             _ => ContainerState::Unknown,
         }
     }
@@ -437,9 +468,11 @@ impl AppleContainerSandbox {
         name: &str,
         image: &str,
         tz: Option<&str>,
-        home_volume: Option<&str>,
+        volumes: &[String],
+        resource_limits: &ResourceLimits,
     ) -> std::result::Result<(), CreateError> {
-        let args = apple_container_run_args(name, image, tz, home_volume);
+        let args = apple_container_run_args(name, image, tz, volumes, resource_limits)
+            .map_err(|error| CreateError::Other(error.to_string()))?;
 
         let output = tokio::process::Command::new("container")
             .args(&args)
@@ -580,7 +613,7 @@ enum CreateError {
 /// Check whether the Apple Container system service is running.
 #[cfg(target_os = "macos")]
 fn is_apple_container_service_running() -> bool {
-    std::process::Command::new("container")
+    Command::new("container")
         .args(["system", "status"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -592,12 +625,16 @@ fn is_apple_container_service_running() -> bool {
 /// Returns `true` if the service was successfully started.
 #[cfg(target_os = "macos")]
 fn try_start_apple_container_service() -> bool {
-    tracing::info!("apple container service is not running, starting it automatically");
-    let result = std::process::Command::new("container")
+    tracing::info!(
+        "apple container service is not running, starting it automatically; first startup can take about a minute"
+    );
+    let progress_done = spawn_apple_container_start_progress_logger();
+    let result = Command::new("container")
         .args(["system", "start"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .status();
+    let _ = progress_done.send(());
     match result {
         Ok(status) if status.success() => {
             tracing::info!("apple container service started successfully");
@@ -620,6 +657,34 @@ fn try_start_apple_container_service() -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn spawn_apple_container_start_progress_logger() -> mpsc::Sender<()> {
+    const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+    spawn_apple_container_start_progress_logger_with_interval(PROGRESS_INTERVAL)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_apple_container_start_progress_logger_with_interval(
+    progress_interval: std::time::Duration,
+) -> mpsc::Sender<()> {
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started_at = Instant::now();
+        loop {
+            match done_rx.recv_timeout(progress_interval) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::info!(
+                        elapsed_secs = started_at.elapsed().as_secs(),
+                        "still starting apple container service"
+                    );
+                },
+            }
+        }
+    });
+    done_tx
+}
+
 /// Ensure the Apple Container system service is running, starting it if needed.
 /// Returns `true` if the service is running (either already or after starting).
 #[cfg(target_os = "macos")]
@@ -637,7 +702,7 @@ pub fn ensure_apple_container_service() -> bool {
 fn restart_apple_container_service() -> bool {
     tracing::warn!("apple container service unhealthy, restarting automatically");
 
-    let stop = std::process::Command::new("container")
+    let stop = Command::new("container")
         .args(["system", "stop"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -710,16 +775,45 @@ impl Sandbox for AppleContainerSandbox {
         "apple-container"
     }
 
+    async fn runtime_name(&self, id: &SandboxId) -> Option<String> {
+        Some(self.container_name(id).await)
+    }
+
     fn provides_fs_isolation(&self) -> bool {
         true
     }
 
+    fn exposes_managed_files(&self) -> bool {
+        self.config.managed_files_mount != ManagedFilesMount::None
+    }
+
     async fn ensure_ready(&self, id: &SandboxId, image_override: Option<&str>) -> Result<()> {
+        validate_apple_container_resource_limits(&self.config.resource_limits)?;
+
         let mut name = self.container_name(id).await;
+        // This state lock also serializes Apple Container creation. The CLI has
+        // no atomic create-or-inspect primitive, so releasing it after policy
+        // validation would let a concurrent caller remove the fresh winner.
+        let mut fingerprints = self.container_policy_fingerprints.lock().await;
+        let desired_fingerprint = self.container_policy_fingerprint();
+        if fingerprints.get(&name) != Some(&desired_fingerprint)
+            && Self::container_exists(&name).await?
+        {
+            warn!(
+                name,
+                "recreating existing apple container to apply sandbox policy"
+            );
+            Self::force_remove_and_wait(&name).await;
+            if Self::container_exists(&name).await? {
+                return Err(Error::message(format!(
+                    "failed to remove apple container '{name}' after sandbox policy changed"
+                )));
+            }
+        }
         let requested_image = image_override.unwrap_or_else(|| self.image());
         let image = self.resolve_local_image(requested_image).await?;
         let tz = self.config.timezone.as_deref();
-        let home_volume = self.home_persistence_volume(id)?;
+        let volumes = self.volumes(id)?;
 
         const MAX_ATTEMPTS: usize = 3;
         let mut daemon_restarted = false;
@@ -733,6 +827,7 @@ impl Sandbox for AppleContainerSandbox {
                     info!(name, "apple container already running");
                     match Self::wait_for_container_exec_ready(&name).await {
                         Ok(()) => {
+                            fingerprints.insert(name.clone(), desired_fingerprint.clone());
                             unmark_zombie(&name);
                             return Ok(());
                         },
@@ -753,6 +848,7 @@ impl Sandbox for AppleContainerSandbox {
                         info!(name, "apple container restarted");
                         match Self::wait_for_container_exec_ready(&name).await {
                             Ok(()) => {
+                                fingerprints.insert(name.clone(), desired_fingerprint.clone());
                                 unmark_zombie(&name);
                                 return Ok(());
                             },
@@ -782,7 +878,9 @@ impl Sandbox for AppleContainerSandbox {
 
             // Phase 2: Create a new container.
             info!(name, image = %image, attempt, "creating apple container");
-            match Self::run_container(&name, &image, tz, home_volume.as_deref()).await {
+            match Self::run_container(&name, &image, tz, &volumes, &self.config.resource_limits)
+                .await
+            {
                 Ok(()) => {},
                 Err(CreateError::AlreadyExists) => {
                     warn!(
@@ -846,6 +944,7 @@ impl Sandbox for AppleContainerSandbox {
                         provision_packages("container", &name, &self.config.packages).await?;
                     }
 
+                    fingerprints.insert(name.clone(), desired_fingerprint.clone());
                     return Ok(());
                 },
                 Err(error) => {
@@ -877,6 +976,7 @@ impl Sandbox for AppleContainerSandbox {
                                         )
                                         .await?;
                                     }
+                                    fingerprints.insert(name.clone(), desired_fingerprint.clone());
                                     return Ok(());
                                 },
                                 Err(restart_error) => {
@@ -1076,6 +1176,14 @@ impl Sandbox for AppleContainerSandbox {
         file_path: &str,
         max_bytes: u64,
     ) -> Result<SandboxReadResult> {
+        match self.managed_files_path(file_path) {
+            ManagedFilesPath::Unavailable => return Ok(SandboxReadResult::PermissionDenied),
+            ManagedFilesPath::ReadOnly(_) | ManagedFilesPath::ReadWrite(_) => {
+                return command_read_file(self, id, file_path, max_bytes).await;
+            },
+            ManagedFilesPath::Unmanaged => {},
+        }
+
         if let Some(host_path) = self.mounted_host_path(id, file_path) {
             return native_host_read_file(
                 host_path
@@ -1095,6 +1203,25 @@ impl Sandbox for AppleContainerSandbox {
         file_path: &str,
         content: &[u8],
     ) -> Result<Option<serde_json::Value>> {
+        match self.managed_files_path(file_path) {
+            ManagedFilesPath::Unavailable => {
+                return Ok(Some(permission_denied_payload(
+                    file_path,
+                    "managed Files are disabled in this sandbox",
+                )));
+            },
+            ManagedFilesPath::ReadOnly(_) => {
+                return Ok(Some(permission_denied_payload(
+                    file_path,
+                    "managed Files are mounted read-only in this sandbox",
+                )));
+            },
+            ManagedFilesPath::ReadWrite(_) => {
+                return command_write_file(self, id, file_path, content).await;
+            },
+            ManagedFilesPath::Unmanaged => {},
+        }
+
         if let Some(host_path) = self.mounted_host_path(id, file_path) {
             return native_host_write_file(
                 host_path
@@ -1109,6 +1236,16 @@ impl Sandbox for AppleContainerSandbox {
     }
 
     async fn list_files(&self, id: &SandboxId, root: &str) -> Result<SandboxListFilesResult> {
+        match self.managed_files_path(root) {
+            ManagedFilesPath::Unavailable => {
+                return Err(Error::message("managed Files are disabled in this sandbox"));
+            },
+            ManagedFilesPath::ReadOnly(_) | ManagedFilesPath::ReadWrite(_) => {
+                return command_list_files(self, id, root).await;
+            },
+            ManagedFilesPath::Unmanaged => {},
+        }
+
         if let Some(host_path) = self.mounted_host_path(id, root) {
             let host_files = native_host_list_files(
                 host_path
@@ -1127,74 +1264,17 @@ impl Sandbox for AppleContainerSandbox {
         base: &str,
         packages: &[String],
     ) -> Result<Option<BuildImageResult>> {
-        if packages.is_empty() {
-            return Ok(None);
-        }
-
-        let tag = sandbox_image_tag(self.image_repo(), base, packages);
-
-        if sandbox_image_exists("container", &tag).await {
-            debug!(
-                tag,
-                "pre-built sandbox image already exists, skipping build"
+        if !packages.is_empty() {
+            info!(
+                base,
+                package_count = packages.len(),
+                "apple container skips pre-built sandbox images; packages are provisioned after container start"
             );
-            return Ok(Some(BuildImageResult { tag, built: false }));
         }
-
-        let tmp_dir =
-            std::env::temp_dir().join(format!("moltis-sandbox-build-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp_dir)?;
-
-        let pkg_list = canonical_sandbox_packages(packages).join(" ");
-        let dockerfile = sandbox_image_dockerfile(base, packages);
-        let dockerfile_path = tmp_dir.join("Dockerfile");
-        std::fs::write(&dockerfile_path, &dockerfile)?;
-
-        info!(tag, packages = %pkg_list, "building pre-built sandbox image (apple container)");
-
-        let output = tokio::process::Command::new("container")
-            .args(["build", "-t", &tag, "-f"])
-            .arg(&dockerfile_path)
-            .arg(&tmp_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await;
-
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-
-        let output = output?;
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("XPC connection error") || stderr.contains("Connection invalid") {
-                return Err(Error::message(
-                    "apple container service is not running. \
-                     Start it with `container system start` and restart moltis",
-                ));
-            }
-            debug!(
-                tag,
-                stdout = %tail_lines(&stdout, 20),
-                stderr = %tail_lines(&stderr, 20),
-                "container build failed"
-            );
-            let status = output.status.code().map_or_else(
-                || output.status.to_string(),
-                |code| format!("exit code {code}"),
-            );
-            return Err(Error::message(format!(
-                "container build failed for {tag}: {}",
-                status
-            )));
-        }
-
-        info!(tag, "pre-built sandbox image ready (apple container)");
-        Ok(Some(BuildImageResult { tag, built: true }))
+        Ok(None)
     }
 
     async fn cleanup(&self, id: &SandboxId) -> Result<()> {
-        let base = self.base_container_name(id);
         let max_generation = self
             .name_generations
             .read()
@@ -1204,11 +1284,7 @@ impl Sandbox for AppleContainerSandbox {
             .unwrap_or(0);
 
         for generation in 0..=max_generation {
-            let name = if generation == 0 {
-                base.clone()
-            } else {
-                format!("{base}-g{generation}")
-            };
+            let name = self.container_name_for_generation(id, generation);
             info!(name, "cleaning up apple container");
             let _ = tokio::process::Command::new("container")
                 .args(["stop", &name])

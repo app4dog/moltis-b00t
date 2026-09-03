@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use {
-    tokio_util::sync::CancellationToken,
-    tracing::{info, warn},
-};
+use {tokio_util::sync::CancellationToken, tracing::info};
 
 use moltis_channels::{ChannelEventSink, message_log::MessageLog};
 
@@ -12,6 +9,23 @@ use crate::{
     handlers,
     state::{AccountState, AccountStateMap, ShutdownState},
 };
+
+/// Name asserted when neither the account nor the agent identity sets one.
+const DEFAULT_PUSH_NAME: &str = "Moltis";
+
+/// Account override, then agent identity, then the default.
+///
+/// Blank entries fall through rather than being honoured: an empty push name
+/// makes the client refuse to send presence at all.
+fn resolve_push_name(account: Option<&str>, identity: Option<&str>) -> String {
+    [account, identity]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_PUSH_NAME)
+        .to_string()
+}
 
 /// Start a WhatsApp connection for the given account.
 ///
@@ -25,6 +39,7 @@ pub async fn start_connection(
     data_dir: std::path::PathBuf,
     message_log: Option<Arc<dyn MessageLog>>,
     event_sink: Option<Arc<dyn ChannelEventSink>>,
+    identity_name: Option<String>,
 ) -> crate::Result<()> {
     // Use persistent sled store at <data_dir>/whatsapp/<account_id>/.
     let store_path = config
@@ -57,8 +72,15 @@ pub async fn start_connection(
     let state_ref_handler = Arc::clone(&state_ref);
     let accounts_handler = Arc::clone(&accounts);
 
-    let mut bot = whatsapp_rust::bot::Bot::builder()
-        .with_backend(backend)
+    // Only changes what this client asserts about itself. The account profile is
+    // left alone on purpose: `Client::set_push_name` rewrites it server side,
+    // which on a number paired from someone's personal phone would rename their
+    // real WhatsApp profile.
+    let push_name = resolve_push_name(config.push_name.as_deref(), identity_name.as_deref());
+    info!(account_id = %account_id, push_name = %push_name, "resolved WhatsApp push name");
+
+    let bot = whatsapp_rust::bot::Bot::builder()
+        .with_backend_arc(backend)
         .with_transport_factory(
             whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory::new(),
         )
@@ -66,11 +88,11 @@ pub async fn start_connection(
         .with_runtime(whatsapp_rust::TokioRuntime)
         .skip_history_sync()
         .with_device_props(
-            Some("Moltis".to_string()),
-            None,
-            Some(waproto::whatsapp::device_props::PlatformType::Desktop),
+            wacore::store::DevicePropsOverride::new()
+                .with_os("Moltis")
+                .with_platform_type(waproto::whatsapp::device_props::PlatformType::Desktop),
         )
-        .with_push_name("Moltis")
+        .with_push_name(push_name)
         .on_event(move |event, client| {
             let state_ref = Arc::clone(&state_ref_handler);
             let accounts = Arc::clone(&accounts_handler);
@@ -128,35 +150,37 @@ pub async fn start_connection(
     // Spawn the event loop.
     let account_id_task = account_id.clone();
     tokio::spawn(async move {
+        // `Bot::run` now drives the whole lifecycle itself (no JoinHandle);
+        // dropping the future on cancel is the supported teardown path.
         tokio::select! {
-            result = bot.run() => {
-                match result {
-                    Ok(handle) => {
-                        tokio::pin!(handle);
-                        tokio::select! {
-                            _ = &mut handle => {
-                                info!(account_id = %account_id_task, "WhatsApp bot task completed");
-                            },
-                            _ = cancel.cancelled() => {
-                                info!(account_id = %account_id_task, "WhatsApp account cancelled, aborting bot task");
-                                handle.abort();
-                                // Wait for the task to finish after abort so the
-                                // sled store is fully released before we signal done.
-                                let _ = handle.await;
-                            },
-                        }
-                    },
-                    Err(e) => {
-                        warn!(account_id = %account_id_task, error = %e, "WhatsApp bot failed to start");
-                    },
-                }
+            _ = bot.run() => {
+                info!(account_id = %account_id_task, "WhatsApp bot task completed");
             },
             _ = cancel.cancelled() => {
-                info!(account_id = %account_id_task, "WhatsApp account cancelled before start");
+                info!(account_id = %account_id_task, "WhatsApp account cancelled");
             },
         }
         shutdown_clone.mark_done();
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_PUSH_NAME, resolve_push_name};
+
+    #[test]
+    fn account_wins_then_identity_then_the_default() {
+        assert_eq!(resolve_push_name(Some("Support"), Some("Ada")), "Support");
+        assert_eq!(resolve_push_name(None, Some("Ada")), "Ada");
+        assert_eq!(resolve_push_name(None, None), DEFAULT_PUSH_NAME);
+    }
+
+    #[test]
+    fn blank_entries_fall_through_instead_of_disabling_presence() {
+        assert_eq!(resolve_push_name(Some("   "), Some("Ada")), "Ada");
+        assert_eq!(resolve_push_name(Some(""), None), DEFAULT_PUSH_NAME);
+        assert_eq!(resolve_push_name(Some("  Ada  "), None), "Ada");
+    }
 }

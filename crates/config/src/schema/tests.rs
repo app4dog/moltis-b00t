@@ -228,6 +228,26 @@ fn mcp_config_defaults_request_timeout() {
 }
 
 #[test]
+fn mcp_server_entry_maps_transport_aliases_to_shared_type() {
+    for transport in ["streamable-http", "streamable_http", "http"] {
+        let entry = McpServerEntry {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            request_timeout_secs: None,
+            transport: transport.to_string(),
+            url: None,
+            headers: HashMap::new(),
+            oauth: None,
+            display_name: None,
+        };
+
+        assert_eq!(entry.transport_type(), McpTransport::StreamableHttp);
+    }
+}
+
+#[test]
 fn mcp_server_entry_parses_request_timeout_override() {
     let config: MoltisConfig = toml::from_str(
         r#"
@@ -525,6 +545,12 @@ fn chat_config_toml_parses_workspace_file_limit() {
 }
 
 #[test]
+fn chat_config_toml_parses_context_command() {
+    let cfg: ChatConfig = toml::from_str(r#"context_command = "thomas context""#).unwrap();
+    assert_eq!(cfg.context_command.as_deref(), Some("thomas context"));
+}
+
+#[test]
 fn providers_config_local_alias_maps_local_llm_to_local() {
     let mut config = ProvidersConfig::default();
     config.providers.insert("local-llm".into(), ProviderEntry {
@@ -669,8 +695,28 @@ fn sandbox_defaults_include_go_runtime() {
     let sandbox = SandboxConfig::default();
     assert!(sandbox.packages.iter().any(|pkg| pkg == "golang-go"));
     assert_eq!(sandbox.home_persistence, HomePersistenceConfig::Shared);
+    assert_eq!(sandbox.managed_files_mount, ManagedFilesMountConfig::Ro);
     assert!(sandbox.host_data_dir.is_none());
     assert!(sandbox.wasm_tool_limits.is_none());
+}
+
+#[test]
+fn sandbox_managed_files_mount_deserializes_all_modes() {
+    for (value, expected) in [
+        ("none", ManagedFilesMountConfig::None),
+        ("ro", ManagedFilesMountConfig::Ro),
+        ("rw", ManagedFilesMountConfig::Rw),
+    ] {
+        let config: SandboxConfig =
+            toml::from_str(&format!("managed_files_mount = \"{value}\"")).unwrap();
+        assert_eq!(config.managed_files_mount, expected);
+    }
+}
+
+#[test]
+fn sandbox_managed_files_mount_rejects_unknown_mode() {
+    let result = toml::from_str::<SandboxConfig>("managed_files_mount = \"write\"");
+    assert!(result.is_err());
 }
 
 #[test]
@@ -767,6 +813,15 @@ browserless_api_version = "v2"
     )
     .unwrap();
     assert_eq!(config.browserless_api_version, BrowserlessApiVersion::V2);
+}
+
+#[test]
+fn obscura_stealth_defaults_enabled_and_can_be_disabled() {
+    let defaults: BrowserConfig = toml::from_str("").unwrap();
+    assert!(defaults.obscura_stealth);
+
+    let disabled: BrowserConfig = toml::from_str("obscura_stealth = false").unwrap();
+    assert!(!disabled.obscura_stealth);
 }
 
 #[test]
@@ -972,6 +1027,23 @@ enabled = true
 }
 
 #[test]
+fn external_agent_models_from_toml() {
+    let toml_str = r#"
+[external_agents]
+enabled = true
+
+[external_agents.agents.claude-code]
+binary = "claude"
+models = ["claude-opus-4-8", "claude-sonnet-4-6"]
+efforts = ["high", "xhigh"]
+"#;
+    let config: MoltisConfig = toml::from_str(toml_str).unwrap();
+    let entry = config.external_agents.agents.get("claude-code").unwrap();
+    assert_eq!(entry.models, vec!["claude-opus-4-8", "claude-sonnet-4-6"]);
+    assert_eq!(entry.efforts, vec!["high", "xhigh"]);
+}
+
+#[test]
 fn provider_entry_wire_api_skip_serializing_default() {
     let entry = ProviderEntry::default();
     let serialized = toml::to_string(&entry).unwrap();
@@ -1015,6 +1087,18 @@ fn terminal_disabled_via_config_reflects_in_helper() {
     // (We cannot test the env-var override here because workspace lints
     // deny unsafe code, and `std::env::set_var` is unsafe.)
     assert!(!cfg.server.is_terminal_enabled());
+}
+
+#[test]
+fn rpc_timeout_ms_defaults_to_5000() {
+    let cfg: MoltisConfig = toml::from_str("").unwrap();
+    assert_eq!(cfg.server.rpc_timeout_ms, 5000);
+}
+
+#[test]
+fn rpc_timeout_ms_parsed_from_config() {
+    let cfg: MoltisConfig = toml::from_str("[server]\nrpc_timeout_ms = 8000\n").unwrap();
+    assert_eq!(cfg.server.rpc_timeout_ms, 8000);
 }
 
 #[test]
@@ -1200,4 +1284,11 @@ mode = "sometimes"
 "#;
     let result: Result<MoltisConfig, _> = toml::from_str(toml_str);
     assert!(result.is_err());
+}
+#[test]
+fn external_agents_default_to_enabled_for_detection() {
+    let config = MoltisConfig::default();
+
+    assert!(config.external_agents.enabled);
+    assert!(config.external_agents.agents.is_empty());
 }

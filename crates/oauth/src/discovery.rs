@@ -41,11 +41,32 @@ pub async fn fetch_resource_metadata(
     resource_url: &Url,
 ) -> Result<ProtectedResourceMetadata> {
     let well_known = build_well_known_url(resource_url, "oauth-protected-resource")?;
+    fetch_resource_metadata_from_url(client, &well_known).await
+}
 
-    debug!(url = %well_known, "fetching protected resource metadata");
+/// Fetch protected resource metadata from an already-known URL.
+///
+/// Unlike [`fetch_resource_metadata`], this does NOT append
+/// `/.well-known/oauth-protected-resource`.  Use this when the URL was
+/// already extracted from a `WWW-Authenticate: Bearer resource_metadata=…`
+/// header (RFC 9728 §5.1), which is the complete metadata endpoint.
+pub async fn fetch_resource_metadata_direct(
+    client: &Client,
+    metadata_url: &Url,
+) -> Result<ProtectedResourceMetadata> {
+    fetch_resource_metadata_from_url(client, metadata_url).await
+}
+
+/// Shared implementation: fetch and parse protected resource metadata from
+/// the given URL.
+async fn fetch_resource_metadata_from_url(
+    client: &Client,
+    url: &Url,
+) -> Result<ProtectedResourceMetadata> {
+    debug!(url = %url, "fetching protected resource metadata");
 
     let resp = client
-        .get(well_known.as_str())
+        .get(url.as_str())
         .header("Accept", "application/json")
         .send()
         .await
@@ -142,6 +163,8 @@ pub struct ClientRegistrationRequest {
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 
 /// Successful registration response.
@@ -164,6 +187,7 @@ pub async fn register_client(
     registration_endpoint: &str,
     redirect_uris: Vec<String>,
     client_name: &str,
+    scopes: &[String],
 ) -> Result<ClientRegistrationResponse> {
     debug!(endpoint = %registration_endpoint, client_name, "registering dynamic OAuth client");
 
@@ -176,6 +200,7 @@ pub async fn register_client(
         ],
         response_types: vec!["code".to_string()],
         token_endpoint_auth_method: "none".to_string(),
+        scope: scopes.join(" "),
     };
 
     let resp = client
@@ -253,6 +278,8 @@ fn build_well_known_url(base: &Url, suffix: &str) -> Result<Url> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    use mockito::Matcher;
+
     use super::*;
 
     // ── WWW-Authenticate parsing ───────────────────────────────────────
@@ -439,6 +466,9 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/register")
+            .match_body(Matcher::PartialJson(serde_json::json!({
+                "scope": "read write",
+            })))
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(
@@ -459,6 +489,7 @@ mod tests {
             &format!("{}/register", server.url()),
             vec!["http://127.0.0.1:9999/auth/callback".to_string()],
             "moltis-test",
+            &["read".to_string(), "write".to_string()],
         )
         .await
         .unwrap();
@@ -491,6 +522,7 @@ mod tests {
             &format!("{}/register", server.url()),
             vec!["http://127.0.0.1:9999/auth/callback".to_string()],
             "moltis",
+            &[],
         )
         .await
         .unwrap();
@@ -515,6 +547,7 @@ mod tests {
             &format!("{}/register", server.url()),
             vec!["http://127.0.0.1:9999/auth/callback".to_string()],
             "moltis",
+            &[],
         )
         .await;
 
@@ -531,5 +564,56 @@ mod tests {
         let url = Url::parse("http://127.0.0.1:1").unwrap();
         let result = fetch_resource_metadata(&client, &url).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_resource_metadata_direct_success() {
+        let mut server = mockito::Server::new_async().await;
+        // The resource_metadata URL from WWW-Authenticate is already the
+        // complete endpoint (RFC 9728 origin-based layout).
+        // fetch_resource_metadata_direct must use it as-is without appending
+        // /.well-known/oauth-protected-resource.
+        let mock = server
+            .mock("GET", "/.well-known/oauth-protected-resource/mcp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "resource": format!("{}/mcp", server.url()),
+                    "authorization_servers": ["https://auth.example.com"]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = Url::parse(&format!(
+            "{}/.well-known/oauth-protected-resource/mcp",
+            server.url()
+        ))
+        .unwrap();
+        let meta = fetch_resource_metadata_direct(&client, &url).await.unwrap();
+
+        assert_eq!(meta.resource, format!("{}/mcp", server.url()));
+        assert_eq!(meta.authorization_servers, vec!["https://auth.example.com"]);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_resource_metadata_direct_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/some/metadata/path")
+            .with_status(404)
+            .with_body("not found")
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let url = Url::parse(&format!("{}/some/metadata/path", server.url())).unwrap();
+        let result = fetch_resource_metadata_direct(&client, &url).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("404"));
     }
 }

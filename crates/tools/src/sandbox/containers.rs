@@ -3,13 +3,15 @@
 use std::collections::HashSet;
 
 use {
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
     sha2::{Digest, Sha256},
     tracing::warn,
 };
 
 #[cfg(any(target_os = "macos", test))]
 use super::types::APPLE_CONTAINER_SAFE_WORKDIR;
+#[cfg(target_os = "macos")]
+use super::types::ResourceLimits;
 use {
     super::types::{
         GO_TOOL_INSTALLS, GOGCLI_MODULE_PATH, GOGCLI_VERSION, SANDBOX_HOME_DIR,
@@ -118,8 +120,11 @@ pub(crate) fn apple_container_run_args(
     name: &str,
     image: &str,
     tz: Option<&str>,
-    home_volume: Option<&str>,
-) -> Vec<String> {
+    volumes: &[String],
+    resource_limits: &ResourceLimits,
+) -> Result<Vec<String>> {
+    validate_apple_container_resource_limits(resource_limits)?;
+
     let mut args = vec![
         "run".to_string(),
         "-d".to_string(),
@@ -132,7 +137,16 @@ pub(crate) fn apple_container_run_args(
     if let Some(tz) = tz {
         args.extend(["-e".to_string(), format!("TZ={tz}")]);
     }
-    if let Some(volume) = home_volume {
+    if let Some(ref memory) = resource_limits.memory_limit {
+        args.extend(["--memory".to_string(), memory.clone()]);
+    }
+    if let Some(cpus) = resource_limits.cpu_quota {
+        args.extend(["--cpus".to_string(), cpus.to_string()]);
+    }
+    if let Some(pids) = resource_limits.pids_max {
+        args.extend(["--ulimit".to_string(), format!("nproc={pids}")]);
+    }
+    for volume in volumes {
         args.extend(["--volume".to_string(), volume.to_string()]);
     }
 
@@ -142,7 +156,26 @@ pub(crate) fn apple_container_run_args(
         "-c".to_string(),
         apple_container_bootstrap_command(),
     ]);
-    args
+    Ok(args)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_apple_container_resource_limits(
+    resource_limits: &ResourceLimits,
+) -> Result<()> {
+    let Some(cpus) = resource_limits.cpu_quota else {
+        return Ok(());
+    };
+    let valid = cpus.is_finite()
+        && cpus >= 1.0
+        && cpus.fract() == 0.0
+        && cpus.to_string().parse::<i64>().is_ok();
+    if !valid {
+        return Err(Error::message(format!(
+            "Apple Container requires cpu_quota to be a positive whole number, got {cpus}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -241,6 +274,17 @@ pub struct SandboxImage {
 
 /// List all local `<instance>-sandbox:*` images across available container CLIs.
 pub async fn list_sandbox_images() -> Result<Vec<SandboxImage>> {
+    list_images_matching(is_sandbox_image_tag).await
+}
+
+pub async fn list_moltis_images(extra_repositories: &[String]) -> Result<Vec<SandboxImage>> {
+    list_images_matching(|tag| {
+        is_sandbox_image_tag(tag) || extra_repositories.iter().any(|repo| tag.starts_with(repo))
+    })
+    .await
+}
+
+async fn list_images_matching(matches_tag: impl Fn(&str) -> bool) -> Result<Vec<SandboxImage>> {
     let mut images = Vec::new();
     let mut seen = HashSet::new();
 
@@ -267,7 +311,7 @@ pub async fn list_sandbox_images() -> Result<Vec<SandboxImage>> {
                 }
                 // Podman prefixes local repos with "localhost/"; normalize.
                 let tag = parts[0].strip_prefix("localhost/").unwrap_or(parts[0]);
-                if is_sandbox_image_tag(tag) && seen.insert(tag.to_string()) {
+                if matches_tag(tag) && seen.insert(tag.to_string()) {
                     images.push(SandboxImage {
                         tag: tag.to_string(),
                         size: parts[1].to_string(),
@@ -290,8 +334,11 @@ pub async fn list_sandbox_images() -> Result<Vec<SandboxImage>> {
             for line in stdout.lines().skip(1) {
                 // Columns are whitespace-separated: NAME TAG DIGEST
                 let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() >= 2 && cols[0].ends_with("-sandbox") {
+                if cols.len() >= 2 {
                     let tag = format!("{}:{}", cols[0], cols[1]);
+                    if !matches_tag(&tag) {
+                        continue;
+                    }
                     if !seen.insert(tag.clone()) {
                         continue;
                     }
@@ -419,6 +466,42 @@ pub enum ContainerRunState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AppleContainerState {
+    Running,
+    Stopped,
+    Exited,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AppleContainerStatus {
+    Legacy(AppleContainerState),
+    Current { state: AppleContainerState },
+}
+
+impl AppleContainerStatus {
+    fn run_state(&self) -> ContainerRunState {
+        match self {
+            Self::Legacy(state) | Self::Current { state } => match state {
+                AppleContainerState::Running => ContainerRunState::Running,
+                AppleContainerState::Stopped => ContainerRunState::Stopped,
+                AppleContainerState::Exited => ContainerRunState::Exited,
+                AppleContainerState::Unknown => ContainerRunState::Unknown,
+            },
+        }
+    }
+}
+
+fn apple_container_run_state(entry: &serde_json::Value) -> Option<ContainerRunState> {
+    let status =
+        serde_json::from_value::<AppleContainerStatus>(entry.get("status")?.clone()).ok()?;
+    Some(status.run_state())
+}
+
 /// Which container backend manages this container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -478,15 +561,21 @@ pub(crate) fn is_zombie(name: &str) -> bool {
 /// Queries both Apple Container and Docker backends when available,
 /// merging results with the appropriate backend label.
 pub async fn list_running_containers(container_prefix: &str) -> Result<Vec<RunningContainer>> {
+    list_running_containers_for_prefixes(&[container_prefix.to_string()]).await
+}
+
+pub async fn list_running_containers_for_prefixes(
+    prefixes: &[String],
+) -> Result<Vec<RunningContainer>> {
     let mut containers = Vec::new();
     let mut seen = HashSet::new();
 
-    // Apple Container: `container list --format json` outputs a JSON array.
+    // Apple Container: `container list --all --format json` outputs a JSON array.
     // Each element has nested fields: configuration.id, status,
     // configuration.image.reference, configuration.resources, networks[].
     if is_cli_available("container") {
         let output = tokio::process::Command::new("container")
-            .args(["list", "--format", "json"])
+            .args(["list", "--all", "--format", "json"])
             .output()
             .await;
         if let Ok(output) = output
@@ -499,19 +588,14 @@ pub async fn list_running_containers(container_prefix: &str) -> Result<Vec<Runni
                     .pointer("/configuration/id")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if !name.starts_with(container_prefix) || !seen.insert(name.to_string()) {
+                if !prefixes.iter().any(|prefix| {
+                    super::container_name::has_apple_container_prefix(name, prefix)
+                        || name.starts_with(prefix)
+                }) || !seen.insert(name.to_string())
+                {
                     continue;
                 }
-                let state_str = entry
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let state = match state_str {
-                    "running" => ContainerRunState::Running,
-                    "stopped" => ContainerRunState::Stopped,
-                    "exited" => ContainerRunState::Exited,
-                    _ => ContainerRunState::Unknown,
-                };
+                let state = apple_container_run_state(&entry).unwrap_or(ContainerRunState::Unknown);
                 let image = entry
                     .pointer("/configuration/image/reference")
                     .and_then(|v| v.as_str())
@@ -527,17 +611,23 @@ pub async fn list_running_containers(container_prefix: &str) -> Result<Vec<Runni
                     .map(|v| v / (1024 * 1024));
                 // startedDate is a Core Foundation absolute time (seconds since 2001-01-01).
                 // Store as unix timestamp string; the frontend formats for display.
-                let started =
-                    entry
-                        .get("startedDate")
-                        .and_then(|v| v.as_f64())
-                        .map(|cf_timestamp| {
-                            // CF absolute time epoch: 2001-01-01T00:00:00Z = 978307200 unix seconds.
-                            let unix_secs = cf_timestamp as i64 + 978_307_200;
-                            unix_secs.to_string()
-                        });
+                let started = entry
+                    .pointer("/status/startedDate")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| {
+                        entry
+                            .get("startedDate")
+                            .and_then(|v| v.as_f64())
+                            .map(|cf_timestamp| {
+                                // Legacy CF absolute time epoch: 2001-01-01T00:00:00Z = 978307200 unix seconds.
+                                let unix_secs = cf_timestamp as i64 + 978_307_200;
+                                unix_secs.to_string()
+                            })
+                    });
                 let addr = entry
-                    .pointer("/networks/0/ipv4Address")
+                    .pointer("/status/networks/0/ipv4Address")
+                    .or_else(|| entry.pointer("/networks/0/ipv4Address"))
                     .and_then(|v| v.as_str())
                     .map(String::from);
 
@@ -564,14 +654,7 @@ pub async fn list_running_containers(container_prefix: &str) -> Result<Vec<Runni
             continue;
         }
         let output = tokio::process::Command::new(cli)
-            .args([
-                "ps",
-                "-a",
-                "--filter",
-                &format!("name={container_prefix}"),
-                "--format",
-                "{{json .}}",
-            ])
+            .args(["ps", "-a", "--format", "{{json .}}"])
             .output()
             .await;
         if let Ok(output) = output
@@ -592,7 +675,9 @@ pub async fn list_running_containers(container_prefix: &str) -> Result<Vec<Runni
                     .get("Names")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if !name.starts_with(container_prefix) || !seen.insert(name.to_string()) {
+                if !prefixes.iter().any(|prefix| name.starts_with(prefix))
+                    || !seen.insert(name.to_string())
+                {
                     continue;
                 }
                 let state_str = json
@@ -822,8 +907,8 @@ pub async fn remove_container(name: &str) -> Result<()> {
         match inspect {
             Ok(ref ins) if ins.status.success() => {
                 let stdout = String::from_utf8_lossy(&ins.stdout);
-                let status = apple_container_status_from_inspect(&stdout);
-                if status == Some("running") {
+                let status = apple_container_run_state_from_inspect(&stdout);
+                if status == Some(ContainerRunState::Running) {
                     // Container is genuinely running — return the rm error.
                     let stderr = output
                         .as_ref()
@@ -923,21 +1008,14 @@ pub async fn restart_container_daemon() -> Result<()> {
     ))
 }
 
-pub(crate) fn apple_container_status_from_inspect(stdout: &str) -> Option<&'static str> {
+pub(crate) fn apple_container_run_state_from_inspect(stdout: &str) -> Option<ContainerRunState> {
     let inspect = stdout.trim();
     if inspect.is_empty() || inspect == "[]" {
         return None;
     }
 
-    if inspect.contains(r#""status":"running""#) {
-        return Some("running");
-    }
-
-    if inspect.contains(r#""status":"stopped""#) || inspect.contains(r#""status":"exited""#) {
-        return Some("stopped");
-    }
-
-    None
+    let entries = serde_json::from_str::<Vec<serde_json::Value>>(inspect).ok()?;
+    entries.first().and_then(apple_container_run_state)
 }
 
 pub(crate) fn is_apple_container_service_error(stderr: &str) -> bool {

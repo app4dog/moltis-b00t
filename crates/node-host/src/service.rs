@@ -34,6 +34,9 @@ pub struct ServiceConfig {
     pub working_dir: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+    /// Executable paths or names explicitly allowed for remote execution.
+    #[serde(default)]
+    pub allowed_programs: Vec<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -217,11 +220,11 @@ pub fn generate_launchd_plist(
         format!("    <string>{bin}</string>"),
         "    <string>node</string>".to_string(),
         "    <string>run</string>".to_string(),
-        format!("    <string>--host</string>"),
+        "    <string>--host</string>".to_string(),
         format!("    <string>{}</string>", xml_escape(&config.gateway_url)),
-        format!("    <string>--token</string>"),
+        "    <string>--token</string>".to_string(),
         format!("    <string>{}</string>", xml_escape(&config.device_token)),
-        format!("    <string>--timeout</string>"),
+        "    <string>--timeout</string>".to_string(),
         format!("    <string>{}</string>", config.timeout),
     ];
 
@@ -612,6 +615,7 @@ mod tests {
             display_name: Some("MacBook".into()),
             working_dir: None,
             timeout: 300,
+            allowed_programs: vec!["/usr/bin/git".into()],
         };
 
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -622,6 +626,7 @@ mod tests {
         assert_eq!(loaded.node_id, config.node_id);
         assert_eq!(loaded.display_name, config.display_name);
         assert_eq!(loaded.timeout, 300);
+        assert_eq!(loaded.allowed_programs, ["/usr/bin/git"]);
     }
 
     #[test]
@@ -636,6 +641,7 @@ mod tests {
             display_name: None,
             working_dir: Some("/tmp".into()),
             timeout: 600,
+            allowed_programs: Vec::new(),
         };
 
         config.save(&dir).unwrap();
@@ -659,6 +665,7 @@ mod tests {
             display_name: Some("Test Node".into()),
             working_dir: Some("/home/user".into()),
             timeout: 120,
+            allowed_programs: Vec::new(),
         };
         let log = PathBuf::from("/tmp/node.log");
 
@@ -690,6 +697,7 @@ mod tests {
             display_name: None,
             working_dir: None,
             timeout: 300,
+            allowed_programs: Vec::new(),
         };
         let log = PathBuf::from("/tmp/node.log");
 
@@ -710,6 +718,7 @@ mod tests {
             display_name: Some("Server".into()),
             working_dir: Some("/srv".into()),
             timeout: 600,
+            allowed_programs: Vec::new(),
         };
         let log = PathBuf::from("/var/log/moltis/node.log");
 
@@ -742,6 +751,7 @@ mod tests {
             display_name: None,
             working_dir: None,
             timeout: 300,
+            allowed_programs: Vec::new(),
         };
         let log = PathBuf::from("/tmp/node.log");
 
@@ -757,6 +767,7 @@ mod tests {
         let json = r#"{"gateway_url":"ws://h/ws","device_token":"t"}"#;
         let config: ServiceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.timeout, 300);
+        assert!(config.allowed_programs.is_empty());
     }
 
     #[test]
